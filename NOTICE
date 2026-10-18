@@ -7,6 +7,15 @@ The ArtCraft name, wordmark and logos in docs/brand/ are trademarks of the ArtCr
 not open source and are not covered by the license above; their terms are in
 docs/brand/LICENSE-brand.txt.
 
+Inspiration (no code)
+
+This fork reimplements ideas from RapidRAW (https://github.com/CyberTimon/RapidRAW, by CyberTimon and
+contributors, AGPL-3.0): drawing the loupe without a CPU readback, rendering only the visible
+region and a downscaled preview while a slider is dragged, rendering thumbnails of edited photos on
+the GPU, and tiling GPU exports with overlap. Only the ideas are taken. No RapidRAW source code,
+shaders or assets are copied into this repository, so it remains under the licence above. See
+docs/rapidraw-port.md.
+
 Third-party material
 
 This product bundles third-party material under its own licenses, listed below. The per-file

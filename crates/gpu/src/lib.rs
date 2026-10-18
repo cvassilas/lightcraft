@@ -345,6 +345,19 @@ pub fn adapter_name() -> Option<String> {
     }
 }
 
+/// Largest buffer a render may use on this device, in bytes (`None` without a device). Sources
+/// and images above it render on the CPU.
+pub fn buffer_limit() -> Option<u64> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        device().map(|g| g.limit())
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        None
+    }
+}
+
 /// Device buffers held by the renderer.
 #[cfg(not(target_arch = "wasm32"))]
 pub use ctx::GpuMemory;

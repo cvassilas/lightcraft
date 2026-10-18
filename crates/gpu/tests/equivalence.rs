@@ -861,6 +861,12 @@ fn windows_of_a_big_photo_share_one_uploaded_source() {
     }
     use lightcraft_pipeline::PixelWindow;
     let src = scene(1, 6000, 4000);
+    // 6000 × 4000 RGB f32 = 275 MiB: above a 128 MiB binding limit (lavapipe, WebGPU defaults) the
+    // source is resampled on the CPU and never uploaded
+    if lightcraft_gpu::buffer_limit().is_some_and(|l| l < (src.data.len() * 12) as u64) {
+        lightcraft_testkit::skip!(Gpu, "the device's buffer limit is below a 24 MP source");
+        return;
+    }
     let info = SourceInfo { raw: true, ..Default::default() };
     let s = DevelopSettings::default();
     let (after, before) = (StageCache::default(), StageCache::default());
