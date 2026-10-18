@@ -322,9 +322,33 @@ A view's stages keep an uploaded source only up to 96 MB (a Preview-level source
 - Result (M4 Pro, 14 raws, loupe, 12 steps): peak RSS 1.9–2.3 GB → 0.83–0.99 GB, peak footprint
   2.5–2.6 GB → 0.91–0.96 GB, heap peak 930 → ~600 MB; stepping median ~13 ms (unchanged).
 
+## One device for the window and the renderer; frames for the loupe (phase 2 of `rapidraw-port.md`)
+- **Shared device.** The desktop window creates its device with the adapter's limits
+  (`backend::window_device_limits`, both for eframe's own set-up and the Windows probe) and offers
+  it with `lightcraft_gpu::share_window_device` once eframe is up. The renderer builds its kernels on
+  that device the first time it is used, instead of creating a second one. Declined (and a device of
+  its own made as before) when the window's backend is not a compute backend (GL), the device lacks
+  ten storage buffers per stage, or GPU rendering already started. On a shared device the renderer's
+  error handler and device-lost callback cover the window's errors too (they log and turn GPU
+  rendering off, as before). `ui.inspect` → `perf.gpuSharesWindow`.
+- **Frames.** A view job asks for its result as a texture too (`RenderJob::with_frame`,
+  `lightcraft_gpu::with_frame`): on the shared device the render records a copy of the per-pixel
+  stage's output into an `Rgba8Unorm` texture (rows padded to 256 bytes by `pad_rows` when needed) in
+  the readback's submission. The texture holds exactly the image's bytes
+  (`tests/shared_device.rs`). The loupe points its egui texture at it
+  (`ui-egui` `FrameSink`, `apps/lightcraft` `WgpuFrames`: `update_egui_texture_from_wgpu_texture`)
+  instead of converting the pixels into a `ColorImage` and uploading them; drawn, it is byte for
+  byte what the upload draws (`frame_tests` in `apps/lightcraft`). Textures are recycled by size.
+  No frame for overlays, windows cut back after the readback, slides, or a display profile (its
+  correction runs on the CPU after the render): those upload as before. `LIGHTCRAFT_GPU_FRAMES=0`
+  turns frames off; `perf.framesFromGpu` counts the results drawn from one.
+- The 8-bit readback still happens (histogram, caches, the pixel probe and screenshots read it).
+
 ## Open items
-- Keep the loupe texture on the GPU (render into an `egui-wgpu` texture on eframe's device instead of
-  reading back); share the device with eframe.
+- Skip the readback for drafts during a drag: a GPU histogram (atomics) and the incomplete/black
+  checks on the device, with the CPU image read back only once the drag ends.
+- Display profiles on the GPU (`display::finish_render`'s correction), so frames also serve a
+  colour-managed screen (macOS uses the screen's profile by default).
 - WebGPU in the browser build (async init, single device per canvas).
 - Defringe and spot removal kernels; Sky/Subject heuristics (replaced by the segmenter in M12).
 - Tiling for sources / outputs beyond the buffer limit (24 MP+ on WebGPU-default limits, 60 MP+
@@ -334,4 +358,4 @@ A view's stages keep an uploaded source only up to 96 MB (a Preview-level source
   faster path for exports.
 - Large-radius blurs at full size (dehaze dark channel at 24 MP) dominate the export: a summed-area
   table or a downsampled dark channel would cut them further.
-- GPU histogram (atomics) to skip the CPU pass over the readback.
+- GPU histogram (atomics) to skip the CPU pass over the readback (see the first open item).

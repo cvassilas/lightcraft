@@ -45,6 +45,26 @@ mod params;
 mod render;
 
 #[cfg(not(target_arch = "wasm32"))]
+pub mod frame;
+
+/// Frames need the shared window device, which the browser build doesn't have: never made there.
+#[cfg(target_arch = "wasm32")]
+pub mod frame {
+    /// A render's result as a texture (none in the browser build).
+    #[derive(Debug)]
+    pub struct Frame {
+        pub width: usize,
+        pub height: usize,
+    }
+    /// Run `f`; no frame is ever made here.
+    pub fn with_frame<R>(f: impl FnOnce() -> R) -> (R, Option<std::sync::Arc<Frame>>) {
+        (f(), None)
+    }
+}
+
+pub use frame::{Frame, with_frame};
+
+#[cfg(not(target_arch = "wasm32"))]
 pub use render::GpuStages;
 
 static ENABLED: AtomicBool = AtomicBool::new(true);
@@ -265,6 +285,51 @@ fn env_disabled() -> bool {
 #[cfg(not(target_arch = "wasm32"))]
 static GPU: std::sync::OnceLock<Result<ctx::Gpu, String>> = std::sync::OnceLock::new();
 
+/// The window's device, offered to the renderer by [`share_window_device`] and taken when the
+/// renderer's device is created.
+#[cfg(not(target_arch = "wasm32"))]
+static OFFERED: std::sync::Mutex<Option<(wgpu::Device, wgpu::Queue, wgpu::AdapterInfo)>> = std::sync::Mutex::new(None);
+
+/// Offer the desktop window's wgpu device (eframe / egui-wgpu) to the renderer, so that both work
+/// on one device: renders can then hand the window their result as a texture, with no copy back to
+/// the CPU (docs/rapidraw-port.md, phase 2). Call it before the first render, on the UI thread
+/// (cheap: it only stores the handles); the kernels are compiled when the device is first used
+/// ([`warm_up`]).
+///
+/// The offer is declined, and the renderer creates its own device as before, when GPU rendering
+/// has already started, when the window's backend is not one compute may use
+/// ([`backend::compute_backends`]: never GL), or when the device lacks what the kernels need. The
+/// window's device must have been created with the adapter's limits
+/// ([`backend::window_device_limits`]); with wgpu's defaults large photos fall back to the CPU.
+/// Returns whether the offer was kept.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn share_window_device(device: &wgpu::Device, queue: &wgpu::Queue, info: wgpu::AdapterInfo) -> bool {
+    if GPU.get().is_some() {
+        return false;
+    }
+    if !backend::compute_backends().is_some_and(|b| b.contains(wgpu::Backends::from(info.backend))) {
+        log::info!("gpu: not sharing the window's {:?} device: compute does not use that backend", info.backend);
+        return false;
+    }
+    *OFFERED.lock().unwrap_or_else(|e| e.into_inner()) = Some((device.clone(), queue.clone(), info));
+    true
+}
+
+/// Whether renders run on the window's device ([`share_window_device`]).
+pub fn shares_window_device() -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        SHARED.load(Ordering::Relaxed) && existing_device().is_some()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        false
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+static SHARED: AtomicBool = AtomicBool::new(false);
+
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn device() -> Option<&'static ctx::Gpu> {
     // turned off (preference, environment): don't even load the driver (issue #136)
@@ -278,7 +343,21 @@ pub(crate) fn device() -> Option<&'static ctx::Gpu> {
     let _work = exit::enter()?;
     GPU.get_or_init(|| {
         let Some(backends) = backend::compute_backends() else { return Err("disabled by LIGHTCRAFT_GPU_BACKEND=off".into()) };
+        let offered = OFFERED.lock().unwrap_or_else(|e| e.into_inner()).take();
         let r = backend::with_init_marker(backends, || {
+            if let Some((device, queue, info)) = offered {
+                let name = info.name.clone();
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx::Gpu::with_device(device, queue, info))) {
+                    Ok(Ok(g)) => {
+                        SHARED.store(true, Ordering::Relaxed);
+                        log::info!("gpu: rendering on the window's device ({name})");
+                        return Ok(g);
+                    }
+                    // the window's device can't run the kernels: try a device of our own
+                    Ok(Err(why)) => log::info!("gpu: not sharing the window's device: {why}"),
+                    Err(_) => log::warn!("gpu: building the renderer on the window's device panicked"),
+                }
+            }
             std::panic::catch_unwind(|| ctx::Gpu::new(backends)).unwrap_or_else(|_| Err("device creation panicked".into()))
         });
         if let Err(why) = &r {

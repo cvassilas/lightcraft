@@ -142,6 +142,13 @@ pub fn base_options() -> WgpuConfiguration {
         n.instance_descriptor.backend_options = backend::backend_options();
         // no indirect-call validation pipeline: Intel Metal fails to compile it and the window never opens (#250)
         n.instance_descriptor.flags = backend::instance_flags_from_env(n.instance_descriptor.flags);
+        // the adapter's limits, not wgpu's defaults: the renderer shares this device
+        // (`lightcraft_gpu::share_window_device`) and needs its large storage buffers
+        n.device_descriptor = std::sync::Arc::new(|adapter| wgpu::DeviceDescriptor {
+            label: Some("egui wgpu device"),
+            required_limits: backend::window_device_limits(adapter),
+            ..Default::default()
+        });
     }
     c
 }
@@ -180,10 +187,10 @@ fn probe(backends: Backends) -> Result<WgpuSetupExisting, String> {
         ..Default::default()
     }))
     .map_err(|e| format!("no adapter: {e}"))?;
-    let base = if adapter.get_info().backend == wgpu::Backend::Gl { wgpu::Limits::downlevel_webgl2_defaults() } else { wgpu::Limits::default() };
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("egui wgpu device"),
-        required_limits: wgpu::Limits { max_texture_dimension_2d: 8192, ..base },
+        // the adapter's limits: the renderer shares this device (`lightcraft_gpu::share_window_device`)
+        required_limits: backend::window_device_limits(&adapter),
         ..Default::default()
     }))
     .map_err(|e| format!("{}: no device: {e}", adapter.get_info().name))?;

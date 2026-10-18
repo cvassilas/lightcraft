@@ -29,6 +29,7 @@ const MODULES: &[Module] = &[
         ],
         entries: &["main"],
     },
+    Module { src: include_str!("wgsl/frame.wgsl"), bindings: &[("src", false, "u32"), ("dst", true, "u32")], entries: &["pad_rows"] },
     Module {
         src: include_str!("wgsl/blur.wgsl"),
         bindings: &[("src", false, "f32"), ("dst", true, "f32")],
@@ -323,17 +324,24 @@ impl Gpu {
             ..Default::default()
         }))
         .map_err(|e| format!("{}: device creation failed ({e})", info.name))?;
-        // Errors outside a render's error scopes (see `ErrorScopes`): log, and stop using the GPU.
-        device.on_uncaptured_error(std::sync::Arc::new(|e| {
-            log::error!("gpu: {e}");
-            crate::mark_broken(&format!("device error: {e}"));
-        }));
-        // wgpu reports a lost device (driver reset, GPU hang, watchdog) only here — never as an
-        // error — so without this callback a lost device went unnoticed.
-        device.set_device_lost_callback(|reason, msg| {
-            log::error!("gpu: device lost ({reason:?}): {msg}");
-            crate::mark_broken(&format!("device lost ({reason:?}): {msg}"));
-        });
+        Gpu::with_device(device, queue, info)
+    }
+
+    /// Build the renderer on an existing device: the window's, when it is shared
+    /// ([`crate::share_window_device`]), or one [`Gpu::new`] just created. Compiles the kernels.
+    pub fn with_device(device: wgpu::Device, queue: wgpu::Queue, info: wgpu::AdapterInfo) -> Result<Gpu, String> {
+        if info.device_type == wgpu::DeviceType::Cpu && !software_allowed() {
+            return Err(format!("software adapter ({}) skipped: the CPU pipeline is faster", info.name));
+        }
+        let mut limits = device.limits();
+        if limits.max_storage_buffers_per_shader_stage < 10 {
+            return Err(format!("{} has too few storage buffers per shader stage ({} < 10)", info.name, limits.max_storage_buffers_per_shader_stage));
+        }
+        // (a device created by `new` already has these; a shared one gets them as the buffer cap)
+        if let Some((binding, buffer)) = limits_override() {
+            limits.max_storage_buffer_binding_size = limits.max_storage_buffer_binding_size.min(binding);
+            limits.max_buffer_size = limits.max_buffer_size.min(buffer);
+        }
         // a kernel the driver's compiler refuses is a validation or an internal error: no GPU, not a half-built one
         let scopes = [device.push_error_scope(wgpu::ErrorFilter::Validation), device.push_error_scope(wgpu::ErrorFilter::Internal)];
         let consts = constants();
@@ -367,6 +375,19 @@ impl Gpu {
             log::error!("gpu: kernels failed to build on {}: {e}", info.name);
             return Err(format!("{}: kernels failed to build ({e})", info.name));
         }
+        // Errors outside a render's error scopes (see `ErrorScopes`): log, and stop using the GPU.
+        // Installed once the kernels built, so a shared window device whose offer is declined keeps
+        // the window's own handler. On a shared device this also covers the window's errors.
+        device.on_uncaptured_error(std::sync::Arc::new(|e| {
+            log::error!("gpu: {e}");
+            crate::mark_broken(&format!("device error: {e}"));
+        }));
+        // wgpu reports a lost device (driver reset, GPU hang, watchdog) only here — never as an
+        // error — so without this callback a lost device went unnoticed.
+        device.set_device_lost_callback(|reason, msg| {
+            log::error!("gpu: device lost ({reason:?}): {msg}");
+            crate::mark_broken(&format!("device lost ({reason:?}): {msg}"));
+        });
         let dummy = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("dummy"),
             size: 16,

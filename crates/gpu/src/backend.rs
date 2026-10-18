@@ -112,6 +112,15 @@ pub fn compute_backends() -> Option<Backends> {
     resolve(env_choice(), default_compute_backends(std::env::consts::OS), wgpu::Instance::enabled_backend_features())
 }
 
+/// The limits to create the desktop window's device with: the adapter's own (everything it
+/// supports), so the renderer can share that device ([`crate::share_window_device`]) and still use
+/// large buffers. GL keeps egui's WebGL2 baseline (compute never runs on GL). Textures up to 8192 px
+/// either way, for depth buffers on 4K+ displays (egui-wgpu's default).
+pub fn window_device_limits(adapter: &wgpu::Adapter) -> wgpu::Limits {
+    let base = if adapter.get_info().backend == wgpu::Backend::Gl { wgpu::Limits::downlevel_webgl2_defaults() } else { adapter.limits() };
+    wgpu::Limits { max_texture_dimension_2d: base.max_texture_dimension_2d.max(8192), ..base }
+}
+
 /// The backends for the desktop window's renderer (eframe/egui-wgpu). The window always needs
 /// one: `off` keeps the platform default.
 pub fn window_backends() -> Backends {

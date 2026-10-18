@@ -23,7 +23,7 @@ source, shader or asset is copied (credit: `NOTICE`, `README.md`).
 | phase | idea (from RapidRAW) | LightCraft today | status |
 |---|---|---|---|
 | 1 | — | fork, build, baseline | this document |
-| 2 | draw the loupe straight from GPU memory | every render read back, histogram on the CPU, re-uploaded to egui | open item in `gpu-pipeline.md` |
+| 2 | draw the loupe straight from GPU memory | every render read back, histogram on the CPU, re-uploaded to egui | shared device and frames done ([`gpu-pipeline.md`](gpu-pipeline.md#one-device-for-the-window-and-the-renderer-frames-for-the-loupe-phase-2-of-rapidraw-portmd)); readback skip and display profiles next |
 | 3 | render only the visible region and a downscaled preview while dragging; half-float trial | stage cache, draft quality, zoom windows | — |
 | 4 | GPU thumbnails for edited photos | thumbnails on the CPU | — |
 | 5 | tiled GPU exports (overlap = largest filter radius) | exports over the buffer limit render on the CPU | open item in `gpu-pipeline.md` |
@@ -65,12 +65,37 @@ the GPU column on a machine with a GPU.
 cargo xtask corpus --download   # CC0 raws from raw.pixls.us into corpus/ (sha256-checked)
 cargo xtask bench               # CPU and GPU columns; appends to target/bench/history.jsonl
 LIGHTCRAFT_PROFILE=1 cargo run --release -p lightcraft-engine --example render_bench \
-  -- corpus/raw/arw-sony-a7m3-compressed.arw   # per-stage timings, incl. "finish + readback"
+  -- corpus/raw/arw-sony-a7m3-compressed.arw   # per-stage timings, incl. "gpu finish" and "gpu readback"
 ```
 
 Keep `target/bench/history.jsonl`: each later run compares itself with the previous one and flags
 CPU-time regressions over 20 %. Upstream's own GPU figures (Apple M4 Pro) are in
 [`gpu-pipeline.md` → Measurements](gpu-pipeline.md#measurements).
+
+### What phase 2 removes, and how to measure it
+
+Showing a finished GPU render costs, on top of the render: the readback of its 8-bit result, the
+histogram pass over it, the copy into egui's texture pixels, and egui's upload of those pixels. The
+CPU-side passes, measured here with `ONLY=present cargo run --release -p lightcraft-engine --example render_bench`:
+
+| | 1920×1280 (loupe) | 3072×2048 (1:1 window) |
+|---|---|---|
+| histogram | 1.1 ms | 2.0 ms |
+| texture copy | 2.4 ms | 8.1 ms |
+
+Frames remove the copy and the upload; the readback and the histogram remain for now
+(`LIGHTCRAFT_PROFILE=1` shows the readback as `gpu readback`). In the desktop app:
+
+```sh
+cargo run --release -p lightcraft -- --demo --control 7980        # then, in another terminal:
+python3 tools/loupe_drag_timing.py --zoom fit                       # and --zoom 100
+# again with LIGHTCRAFT_GPU_FRAMES=0 on the app for the "before" numbers
+```
+
+It prints tick→shown times, the window's frame time with painting and uploads
+(`perf.hostFrameMs`), and how many renders were drawn from their frame. The control channel keeps a
+CPU copy of each texture for headless screenshots, so under it the copy still runs (on the render
+worker) and the A/B shows the upload alone.
 
 ## Testing the GPU path without a GPU
 

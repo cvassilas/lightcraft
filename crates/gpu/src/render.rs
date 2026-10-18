@@ -156,6 +156,11 @@ impl<'a> Cx<'a> {
         }
     }
 
+    /// The encoder commands are recorded into (copies that are not kernels).
+    pub fn encoder(&mut self) -> &mut wgpu::CommandEncoder {
+        self.enc.get_or_insert_with(|| self.gpu.encoder())
+    }
+
     /// Submit what is recorded and read back `len` values of `b`.
     pub fn read<T: bytemuck::Pod>(&mut self, b: &Buf, len: usize) -> Vec<T> {
         self.pending = 0;
@@ -709,6 +714,7 @@ pub fn render(
             groups2(w, rows.min(h - y0), [16, 16]),
         );
     }
+    lap("finish", &mut t, &mut cx);
     // the alpha a mask overlay shows: copied out before the readback below submits
     let overlay_mask = req.overlay.mask(s).map(|m| {
         let list = s.masks.iter().filter(|m| m.visible && !m.components.is_empty());
@@ -738,9 +744,13 @@ pub fn render(
     } else {
         None
     };
+    // a frame for the window (shared device): the texture copy rides in the readback's submission
+    let frame = (crate::frame::wanted() && matches!(req.overlay, lightcraft_pipeline::Overlay::None) && plan.keep.is_none() && req.display.is_none())
+        .then(|| crate::frame::record(&mut cx, &out, w, h))
+        .flatten();
     let data: Vec<[u8; 4]> = cx.read(&out, n);
     let image = Rgba8 { width: w, height: h, data };
-    lap("finish + readback", &mut t, &mut cx);
+    lap("readback", &mut t, &mut cx);
     if crate::ctx::failed() {
         return None;
     }
@@ -778,6 +788,7 @@ pub fn render(
     if let Some(k) = plan.keep {
         image = image.crop(k.x, k.y, k.w, k.h);
     }
+    crate::frame::deliver(frame);
     Some(Rendered { image, histogram, deep: None })
 }
 
