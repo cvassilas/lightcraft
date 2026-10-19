@@ -496,6 +496,28 @@ fn file_dialog() -> rfd::FileDialog {
 
 /// The platform services; `cc` is the window the file dialogs belong to (its `egui_ctx` repaints
 /// when a dialog closes), and `log_file` is for Help ▸ Open Log Folder.
+/// Points an egui texture at a render's GPU frame (`lightcraft_ui_egui::render::FrameSink`): the
+/// loupe then draws the render where the GPU left it, with no upload (docs/rapidraw-port.md,
+/// phase 2). Frames exist only when the renderer shares this window's device
+/// (`lightcraft_gpu::share_window_device`).
+struct WgpuFrames {
+    device: eframe::wgpu::Device,
+    renderer: std::sync::Arc<egui::mutex::RwLock<eframe::egui_wgpu::Renderer>>,
+}
+
+impl lightcraft_ui_egui::render::FrameSink for WgpuFrames {
+    fn show(&self, id: egui::TextureId, frame: &lightcraft_engine::gpu::Frame) -> bool {
+        let mut r = self.renderer.write();
+        // egui allocates a texture when a frame using it is painted; until then there is nothing to point
+        if r.texture(&id).is_none() {
+            return false;
+        }
+        // the sampler of `TextureOptions::LINEAR`, which the CPU path uploads with
+        r.update_egui_texture_from_wgpu_texture(&self.device, frame.view(), eframe::wgpu::FilterMode::Linear, id);
+        true
+    }
+}
+
 fn services(cc: &eframe::CreationContext<'_>, log_file: Option<&std::path::Path>) -> Services {
     let ctx = cc.egui_ctx.clone();
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -535,6 +557,10 @@ fn services(cc: &eframe::CreationContext<'_>, log_file: Option<&std::path::Path>
             Ok(rx)
         })),
         log_file: log_file.map(|p| p.display().to_string()),
+        frame_sink: cc.wgpu_render_state.as_ref().map(|rs| {
+            std::sync::Arc::new(WgpuFrames { device: rs.device.clone(), renderer: rs.renderer.clone() })
+                as std::sync::Arc<dyn lightcraft_ui_egui::render::FrameSink>
+        }),
         pick_lightroom_catalog: Some(Box::new(|| {
             file_dialog()
                 .set_title(lightcraft_ui_egui::i18n::tr("Import Lightroom Catalog"))
@@ -968,6 +994,11 @@ fn main() -> eframe::Result {
                 session = session.with_default_sam3_model();
                 // HDR display: SDR unless the surface, platform and display all allow HDR
                 hdr_display::report(cc.wgpu_render_state.as_ref().map(|r| r.target_format));
+                // one device for the window and the renderer: renders can reach the screen without
+                // a copy back to the CPU (docs/rapidraw-port.md, phase 2)
+                if let Some(rs) = &cc.wgpu_render_state {
+                    lightcraft_engine::gpu::share_window_device(&rs.device, &rs.queue, rs.adapter.get_info());
+                }
                 let mut app = LightcraftApp::new(session, services(cc, app_log_file.as_deref()));
                 if let Some(ui) = prefs {
                     app.ui = ui;
@@ -1563,5 +1594,148 @@ mod config_path_tests {
         assert_eq!(panic_log_path_with(|_| Some("isolated".into()), temp.clone()), std::path::PathBuf::from("isolated/lightcraft-panics.log"));
         assert_eq!(panic_log_path_with(|_| None, temp.clone()), temp.join("lightcraft-panics.log"));
         assert_eq!(panic_log_path_with(|_| Some("".into()), temp.clone()), temp.join("lightcraft-panics.log"));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod frame_tests {
+    use super::*;
+    use eframe::egui_wgpu::{Renderer, RendererOptions, ScreenDescriptor};
+    use eframe::wgpu;
+    use lightcraft_ui_egui::render::FrameSink;
+    use std::sync::Arc;
+
+    /// A device made like the window's (`window_gpu`), shared with the renderer.
+    fn shared_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let backends = lightcraft_engine::gpu::backend::compute_backends()?;
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends, ..wgpu::InstanceDescriptor::new_without_display_handle() });
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("window"),
+            required_limits: lightcraft_engine::gpu::backend::window_device_limits(&adapter),
+            ..Default::default()
+        }))
+        .ok()?;
+        lightcraft_engine::gpu::share_window_device(&device, &queue, adapter.get_info());
+        Some((device, queue))
+    }
+
+    /// Paint `id` over a `w × h` screen at 1:1 with egui-wgpu and read the screen back.
+    fn paint(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        renderer: &mut Renderer,
+        ctx: &egui::Context,
+        id: egui::TextureId,
+        (w, h): (u32, u32),
+    ) -> Vec<u8> {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w as f32, h as f32));
+        let input = egui::RawInput { screen_rect: Some(rect), ..Default::default() };
+        let out = ctx.run_ui(input, |ui| {
+            ui.ctx().layer_painter(egui::LayerId::background()).image(
+                id,
+                rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        });
+        for (tid, deltas) in &out.textures_delta.set {
+            for delta in deltas {
+                renderer.update_texture(device, queue, *tid, delta);
+            }
+        }
+        let jobs = ctx.tessellate(out.shapes, 1.0);
+        let screen = ScreenDescriptor { size_in_pixels: [w, h], pixels_per_point: 1.0 };
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = target.create_view(&Default::default());
+        let mut enc = device.create_command_encoder(&Default::default());
+        let mut cmds = renderer.update_buffers(device, queue, &mut enc, &jobs, &screen);
+        {
+            let mut pass = enc
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: None,
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                    })],
+                    ..Default::default()
+                })
+                .forget_lifetime();
+            renderer.render(&mut pass, &jobs, &screen);
+        }
+        let stride = (w as usize * 4).div_ceil(256) * 256;
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (stride * h as usize) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        enc.copy_texture_to_buffer(
+            target.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(stride as u32), rows_per_image: Some(h) },
+            },
+            target.size(),
+        );
+        cmds.push(enc.finish());
+        queue.submit(cmds);
+        buf.slice(..).map_async(wgpu::MapMode::Read, |r| r.expect("map"));
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+        let bytes = buf.slice(..).get_mapped_range().expect("mapped");
+        (0..h as usize).flat_map(|y| bytes[y * stride..y * stride + w as usize * 4].to_vec()).collect()
+    }
+
+    /// The loupe drawn from a render's GPU frame (`WgpuFrames`) shows exactly what uploading the
+    /// render's pixels shows; an id egui hasn't allocated yet is refused, so its pixels get uploaded.
+    #[test]
+    fn a_gpu_frame_draws_like_its_uploaded_pixels() {
+        let Some((device, queue)) = shared_device() else {
+            lightcraft_testkit::skip!(Gpu, "no GPU adapter");
+            return;
+        };
+        if !lightcraft_engine::gpu::available() || !lightcraft_engine::gpu::shares_window_device() {
+            lightcraft_testkit::skip!(Gpu, "no GPU adapter the pipeline accepts ({:?})", lightcraft_engine::gpu::unavailable_reason());
+            return;
+        }
+        // a smooth gradient with some colour, 3:2
+        let (sw, sh) = (600, 400);
+        let data = (0..sw * sh).map(|i| [(i % sw) as f32 / sw as f32, (i / sw) as f32 / sh as f32, 0.3]).collect();
+        let src = Arc::new(lightcraft_raster::Rgb32f { width: sw, height: sh, data });
+        let mut s = lightcraft_engine::develop::DevelopSettings::default();
+        s.light.exposure = 0.3;
+        let req = lightcraft_engine::pipeline::RenderRequest::fit(450, 300);
+        let info = lightcraft_engine::pipeline::SourceInfo::default();
+        let (r, frame) = lightcraft_engine::gpu::with_frame(|| lightcraft_engine::gpu::render(&src, &info, &s, &req, None));
+        let img = r.expect("gpu render").image;
+        let frame = frame.expect("a frame on the shared device");
+        let size = (img.width as u32, img.height as u32);
+
+        let renderer = Arc::new(egui::mutex::RwLock::new(Renderer::new(&device, wgpu::TextureFormat::Rgba8Unorm, RendererOptions::default())));
+        let sink = WgpuFrames { device: device.clone(), renderer: renderer.clone() };
+        let ctx = egui::Context::default();
+        let bytes: Vec<u8> = img.data.iter().flatten().copied().collect();
+        let tex = ctx.load_texture("loupe", egui::ColorImage::from_rgba_unmultiplied([img.width, img.height], &bytes), egui::TextureOptions::LINEAR);
+        assert!(!sink.show(tex.id(), &frame), "egui has not allocated the texture yet");
+        // the CPU path: the pixels uploaded
+        let uploaded = paint(&device, &queue, &mut renderer.write(), &ctx, tex.id(), size);
+        // the same texture pointed at the frame instead
+        assert!(sink.show(tex.id(), &frame));
+        let from_gpu = paint(&device, &queue, &mut renderer.write(), &ctx, tex.id(), size);
+        assert!(uploaded.iter().any(|&b| b > 0), "something was drawn");
+        let max = uploaded.iter().zip(&from_gpu).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0);
+        assert_eq!(max, 0, "the loupe drawn from the GPU frame differs from the uploaded pixels");
     }
 }

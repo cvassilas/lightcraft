@@ -285,6 +285,42 @@ fn main() {
             drop(develop(&preview, &info, &t, &view, Some(&caches[g as usize]), g));
         });
     }
+    if run("present") {
+        // What showing a finished GPU render costs on the CPU today, per frame, on top of the
+        // readback (`LIGHTCRAFT_PROFILE=1` → "gpu readback"): the histogram pass over the 8-bit
+        // result, and the copy into egui's texture pixels (`ui-egui` `color_image`) before egui
+        // uploads it again. A loupe drawn straight from GPU memory skips all three.
+        for (w, h) in [(1920, 1280), (3072, 2304)] {
+            let img = develop(&preview, &info, &s, &RenderRequest::fit(w, h), None, false).image;
+            let (w, h) = (img.width, img.height);
+            println!(
+                "{:<38} {}",
+                format!("present histogram {w}×{h}:"),
+                best(n, || drop(std::hint::black_box(lightcraft_raster::Histogram::of_srgb8(&img))))
+            );
+            println!(
+                "{:<38} {}",
+                format!("present texture copy {w}×{h}:"),
+                best(n, || {
+                    // the same per-pixel work as `color_image` (opaque pixels are copied, others
+                    // premultiplied), without depending on egui here
+                    let px: Vec<[u8; 4]> = img
+                        .data
+                        .iter()
+                        .map(|p| {
+                            if p[3] == 255 {
+                                *p
+                            } else {
+                                let a = p[3] as u16;
+                                [(p[0] as u16 * a / 255) as u8, (p[1] as u16 * a / 255) as u8, (p[2] as u16 * a / 255) as u8, p[3]]
+                            }
+                        })
+                        .collect();
+                    drop(std::hint::black_box(px));
+                })
+            );
+        }
+    }
     if run("window") {
         // a 1:1 zoom window (the loupe's `Slot::Region`): visible 1920×1200 + margin, snapped to the
         // 256 px grid, cut from the full-resolution original (`ui-egui` `region::window_for`)

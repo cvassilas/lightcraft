@@ -170,6 +170,7 @@ fn services(originals: Originals, backend: Option<Backend>, files: Files, frozen
     Services {
         picker: None,
         pick_display_profile: None,
+        frame_sink: None,
         screen_profile: None,
         backup_library: Some(Box::new(move |session: &mut Session| {
             let Some(b) = backup_backend.clone() else { return Err("nothing is stored in this browser session (?store=memory)".into()) };

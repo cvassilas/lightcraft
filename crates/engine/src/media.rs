@@ -761,6 +761,9 @@ pub struct RenderJob {
     /// A face tile that can be cut from the raw's embedded preview, tried before `source`
     /// ([`crate::Session::face_job`]; `None` for every other job).
     pub preview_cut: Option<crate::face_tiles::PreviewCut>,
+    /// Also hand the result to the window as a texture on the shared GPU device, when the render
+    /// can ([`Self::with_frame`], [`RenderResult::frame`]).
+    pub frame: bool,
 }
 
 pub struct RenderResult {
@@ -770,6 +773,10 @@ pub struct RenderResult {
     pub level: SourceLevel,
     pub key: u64,
     pub rendered: Result<Rendered, String>,
+    /// The result as a texture on the window's GPU device, when the job asked for one
+    /// ([`RenderJob::with_frame`]) and the render could make it: the same pixels as `rendered`'s
+    /// image, ready to draw without an upload.
+    pub frame: Option<Arc<lightcraft_gpu::Frame>>,
     /// Set when this job's render was tried on the GPU and fell back to the CPU: why
     /// ([`lightcraft_gpu::Fallback::Failed`]). The result is the CPU render either way.
     pub gpu_fallback: Option<String>,
@@ -850,6 +857,13 @@ impl RenderJob {
         self
     }
 
+    /// Ask for the result as a texture too ([`RenderResult::frame`]): for the loupe's views, which
+    /// then draw it without copying it into a texture of their own.
+    pub fn with_frame(mut self) -> Self {
+        self.frame = true;
+        self
+    }
+
     /// Render for a monitor profile: into the display's primaries (its gamut, not sRGB's), ready
     /// to show ([`RenderResult::display`]). The histogram and the cached view preview stay sRGB.
     /// Gets its own result key. Thumbnail jobs (rendered-thumbnail cache) are left as they are:
@@ -884,6 +898,7 @@ impl RenderJob {
             key: self.key,
             rendered: Err(e),
             gpu_fallback: None,
+            frame: None,
             loaded: None,
             quick: None,
             display: None,
@@ -927,6 +942,7 @@ impl RenderJob {
                 key: self.key,
                 rendered: Ok(Rendered { image, histogram, deep: None }),
                 gpu_fallback: None,
+                frame: None,
                 loaded: None,
                 quick: None,
                 display: None,
@@ -947,6 +963,7 @@ impl RenderJob {
                 key: self.key,
                 rendered: Ok(Rendered { image, histogram, deep: None }),
                 gpu_fallback: None,
+                frame: None,
                 loaded: None,
                 quick: None,
                 display: None,
@@ -968,7 +985,10 @@ impl RenderJob {
                 // Thumbnails (many small jobs side by side) stay on the CPU; views and exports use
                 // the GPU when there is one.
                 let gpu = self.cache.is_none();
-                let (mut rendered, gpu_fallback) = develop_reporting(src, &info, &self.settings, &self.request, self.stages.as_deref(), gpu);
+                let develop = || develop_reporting(src, &info, &self.settings, &self.request, self.stages.as_deref(), gpu);
+                // (a slide is composed on the CPU after the render: no frame for it)
+                let ((mut rendered, gpu_fallback), frame) =
+                    if self.frame && self.slide.is_none() { lightcraft_gpu::with_frame(develop) } else { (develop(), None) };
                 // for a display profile: the image goes to the display's values, the histogram
                 // and the cached view preview stay sRGB
                 let mut srgb = None;
@@ -1002,6 +1022,7 @@ impl RenderJob {
                     key: self.key,
                     rendered: Ok(rendered),
                     gpu_fallback,
+                    frame,
                     loaded: (!was_loaded).then_some(source),
                     quick: None,
                     display,
@@ -1107,6 +1128,7 @@ impl QuickJob {
             key,
             rendered: Err(e),
             gpu_fallback: None,
+            frame: None,
             loaded: None,
             quick: None,
             display: None,
@@ -1124,6 +1146,7 @@ impl QuickJob {
             key,
             rendered,
             gpu_fallback: None,
+            frame: None,
             loaded: None,
             quick,
             display: None,
@@ -1266,6 +1289,7 @@ impl crate::Session {
             display: None,
             slide: None,
             preview_cut: None,
+            frame: false,
         })
     }
 
@@ -1319,6 +1343,7 @@ impl crate::Session {
             display: None,
             slide: None,
             preview_cut: None,
+            frame: false,
         })
     }
 
@@ -1373,6 +1398,7 @@ impl crate::Session {
             display: None,
             slide: None,
             preview_cut,
+            frame: false,
         })
     }
 

@@ -299,6 +299,9 @@ pub struct Services {
     pub restore_library: Option<HostAction>,
     /// The system appearance for Appearance Mode ▸ Auto, ahead of egui's own report.
     pub system_theme: Option<SystemThemeFn>,
+    /// Draws the loupe's renders straight from GPU memory ([`render::FrameSink`]; desktop, when
+    /// the window and the renderer share a device).
+    pub frame_sink: Option<std::sync::Arc<dyn render::FrameSink>>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -487,8 +490,12 @@ impl LightcraftApp {
         Self {
             session,
             ui: UiState::default(),
+            renderer: {
+                let mut r = render::Renderer::default();
+                r.set_frame_sink(services.frame_sink.clone());
+                r
+            },
             services,
-            renderer: render::Renderer::default(),
             perf: Perf::default(),
             caches: Caches::default(),
             integrated_titlebar: false,

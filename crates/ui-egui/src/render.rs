@@ -77,6 +77,19 @@ pub struct Tex {
     pub quick: Option<QuickSource>,
     /// CPU copy of the pixels (only with [`Renderer::keep_pixels`]; for headless screenshots).
     pub pixels: Option<std::sync::Arc<egui::ColorImage>>,
+    /// The GPU frame `tex` currently shows instead of its own pixels ([`FrameSink`]), kept alive
+    /// while it is on screen.
+    pub frame: Option<Arc<lightcraft_engine::gpu::Frame>>,
+}
+
+/// Shows a render's GPU frame ([`lightcraft_engine::gpu::Frame`]) under an egui texture id, with
+/// no upload: the host's window renderer runs on the device the frame was rendered on
+/// (`lightcraft_gpu::share_window_device`). The desktop app's egui-wgpu renderer implements it
+/// (docs/rapidraw-port.md, phase 2).
+pub trait FrameSink {
+    /// Point `id` (a texture egui already allocated) at `frame`. `false` when it can't (the id
+    /// has no texture in the renderer yet): the caller uploads the pixels instead.
+    fn show(&self, id: egui::TextureId, frame: &lightcraft_engine::gpu::Frame) -> bool;
 }
 
 /// Runs render jobs outside this thread's job pool (the browser build: Web Workers, each with its
@@ -240,6 +253,11 @@ pub struct Renderer {
     pub(crate) stage_budget_override: Option<usize>,
     /// The monitor profile textures are made for (`app.displayProfile`; `None`: sRGB).
     display: Option<Arc<lightcraft_engine::display::Display>>,
+    /// Draws views' GPU frames without uploading their pixels ([`FrameSink`]; desktop with a
+    /// shared device only).
+    frame_sink: Option<Arc<dyn FrameSink>>,
+    /// View results shown from their GPU frame (for `ui.inspect` → perf, and tests).
+    pub frames_shown: u64,
     /// Since when nothing has been pending, and whether the GPU pool was trimmed since.
     #[cfg(not(target_arch = "wasm32"))]
     idle: Option<(std::time::Instant, bool)>,
@@ -301,6 +319,8 @@ impl Renderer {
             #[cfg(test)]
             stage_budget_override: None,
             display: None,
+            frame_sink: None,
+            frames_shown: 0,
             #[cfg(not(target_arch = "wasm32"))]
             idle: None,
         }
@@ -381,7 +401,18 @@ impl Renderer {
     /// `job` as [`Self::request`] would run it for `slot` (its key included): views render for
     /// the display profile in use.
     pub fn job_for(&self, slot: Slot, job: RenderJob) -> RenderJob {
-        if Self::renders_for_display(slot) { job.with_display(self.display.clone()) } else { job }
+        if !Self::renders_for_display(slot) {
+            return job;
+        }
+        // a view on an sRGB screen can be drawn from its GPU frame (a display profile is applied
+        // on the CPU after the render, so those upload their pixels)
+        let job = if self.frame_sink.is_some() && self.display.is_none() && !matches!(slot, Slot::Slide(_)) { job.with_frame() } else { job };
+        job.with_display(self.display.clone())
+    }
+
+    /// Draw views from their GPU frames through `sink` from now on ([`FrameSink`]).
+    pub fn set_frame_sink(&mut self, sink: Option<Arc<dyn FrameSink>>) {
+        self.frame_sink = sink;
     }
 
     /// The display profile in use (id).
@@ -403,13 +434,15 @@ impl Renderer {
         self.display = display;
     }
 
-    /// Run `job` and make its image ready for `display` (on the worker thread).
-    fn run_for(job: impl FnOnce() -> RenderResult, display: &Option<Arc<lightcraft_engine::display::Display>>) -> Finished {
+    /// Run `job` and make its image ready for `display` (on the worker thread). `keep`: the CPU
+    /// texture pixels are wanted even when the result has a GPU frame ([`Self::keep_pixels`]).
+    fn run_for(job: impl FnOnce() -> RenderResult, display: &Option<Arc<lightcraft_engine::display::Display>>, keep: bool) -> Finished {
         let mut r = job();
         if let Some(d) = display {
             lightcraft_engine::display::present(&mut r, d);
         }
-        let color = r.rendered.as_ref().ok().map(|x| Arc::new(color_image(&x.image)));
+        // a result with a GPU frame is drawn from it: no texture pixels to make, unless a CPU copy is kept
+        let color = r.rendered.as_ref().ok().filter(|_| r.frame.is_none() || keep).map(|x| Arc::new(color_image(&x.image)));
         Finished { result: r, color }
     }
 
@@ -472,13 +505,14 @@ impl Renderer {
         let key = job.key;
         let background = matches!(slot, Slot::Thumb(_) | Slot::ThumbQuick(_) | Slot::Prefetch(_));
         let display = self.display.clone();
+        let keep = self.keep_pixels;
         self.pool.submit(
             slot,
             key,
             priority,
             Box::new(move || {
                 let run = || if background { lightcraft_engine::memory::in_background(|| job.run()) } else { job.run() };
-                Self::run_for(run, &display)
+                Self::run_for(run, &display, keep)
             }),
         );
     }
@@ -494,7 +528,7 @@ impl Renderer {
         self.request_ids.insert(slot, job.request_id);
         let key = job.key;
         let display = self.display.clone();
-        self.pool.submit(slot, key, priority, Box::new(move || Self::run_for(|| job.run(), &display)));
+        self.pool.submit(slot, key, priority, Box::new(move || Self::run_for(|| job.run(), &display, true)));
     }
 
     /// Render a slideshow title screen into `slot` (once per screen key, like [`Self::request`]):
@@ -512,7 +546,7 @@ impl Renderer {
         let request_id = lightcraft_preview::next_tick();
         self.request_ids.insert(slot, request_id);
         let display = self.display.clone();
-        self.pool.submit(slot, key, priority, Box::new(move || Self::run_for(|| compose.result(request_id), &display)));
+        self.pool.submit(slot, key, priority, Box::new(move || Self::run_for(|| compose.result(request_id), &display, true)));
     }
 
     /// Prepare a photo in the background (a [`Slot::Prefetch`] job runs once per key; a newer one
@@ -851,13 +885,27 @@ impl Renderer {
                 self.textures.remove(&Slot::ThumbQuick(id));
             }
             let img = &rendered.image;
-            let color = color.unwrap_or_else(|| Arc::new(color_image(img)));
-            let pixels = self.keep_pixels.then(|| color.clone());
+            // the GPU frame of the same pixels, when this screen can show it (sRGB)
+            let frame = r.frame.take().filter(|_| self.display.is_none());
             let name = format!("{slot:?}");
             match self.textures.get_mut(&slot) {
+                Some(t) if frame.as_ref().zip(self.frame_sink.as_ref()).is_some_and(|(f, sink)| sink.show(t.tex.id(), f)) => {
+                    // drawn from the GPU: nothing uploaded (and nothing copied unless a CPU copy is kept)
+                    t.frame = frame;
+                    t.pixels = if self.keep_pixels { color.or_else(|| Some(Arc::new(color_image(img)))) } else { None };
+                    t.key = r.key;
+                    t.photo = r.photo;
+                    t.size = [img.width, img.height];
+                    t.histogram = Some(rendered.histogram);
+                    t.ms = ms;
+                    t.quick = r.quick;
+                    self.frames_shown += 1;
+                }
                 Some(t) => {
+                    let color = color.unwrap_or_else(|| Arc::new(color_image(img)));
+                    t.pixels = self.keep_pixels.then(|| color.clone());
                     t.tex.set(color, egui::TextureOptions::LINEAR);
-                    t.pixels = pixels;
+                    t.frame = None;
                     t.key = r.key;
                     t.photo = r.photo;
                     t.size = [img.width, img.height];
@@ -866,6 +914,10 @@ impl Renderer {
                     t.quick = r.quick;
                 }
                 None => {
+                    // (a new texture: egui allocates it when this frame is painted, so its first
+                    // pixels are uploaded)
+                    let color = color.unwrap_or_else(|| Arc::new(color_image(img)));
+                    let pixels = self.keep_pixels.then(|| color.clone());
                     let tex = ctx.load_texture(name, color, egui::TextureOptions::LINEAR);
                     self.textures.insert(
                         slot,
@@ -878,6 +930,7 @@ impl Renderer {
                             ms,
                             quick: r.quick,
                             pixels,
+                            frame: None,
                         },
                     );
                 }
@@ -1530,7 +1583,10 @@ mod stage_budget_tests {
         let ctx = egui::Context::default();
         let mut r = Renderer::default();
         let tex = ctx.load_texture("window", egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]), Default::default());
-        r.textures.insert(Slot::Region, Tex { key: 1, photo: PhotoId(1), tex, size: [1, 1], histogram: None, ms: 0.0, quick: None, pixels: None });
+        r.textures.insert(
+            Slot::Region,
+            Tex { key: 1, photo: PhotoId(1), tex, size: [1, 1], histogram: None, ms: 0.0, quick: None, pixels: None, frame: None },
+        );
         let long_ago = std::time::Instant::now().checked_sub(IDLE_TRIM * 2).unwrap();
         r.idle = Some((long_ago, false));
         r.trim_when_idle(&ctx);
@@ -1658,14 +1714,15 @@ mod color_image_tests {
             key: 1,
             rendered,
             gpu_fallback: None,
+            frame: None,
             loaded: None,
             quick: None,
             display: None,
         };
         let histogram = Histogram::of_srgb8(&image);
-        let ok = Renderer::run_for(|| result(Ok(lightcraft_pipeline::Rendered { image: image.clone(), histogram, deep: None })), &None);
+        let ok = Renderer::run_for(|| result(Ok(lightcraft_pipeline::Rendered { image: image.clone(), histogram, deep: None })), &None, true);
         assert_eq!(ok.color.map(|c| c.pixels.clone()), Some(color_image(&image).pixels));
-        let failed = Renderer::run_for(|| result(Err("unreadable".into())), &None);
+        let failed = Renderer::run_for(|| result(Err("unreadable".into())), &None, true);
         assert!(failed.color.is_none());
     }
 
