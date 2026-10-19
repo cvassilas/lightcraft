@@ -280,6 +280,13 @@ fn module_source(m: &Module, consts: &str) -> String {
     s
 }
 
+/// `LIGHTCRAFT_GPU_SOFTWARE=1`: accept a software adapter (llvmpipe / lavapipe, WARP) for the
+/// compute device. It is slower than the CPU pipeline, so this is only for checking the GPU path's
+/// correctness (equivalence tests) on machines without a GPU, such as cloud containers.
+fn software_allowed() -> bool {
+    std::env::var_os("LIGHTCRAFT_GPU_SOFTWARE").is_some_and(|v| v == "1")
+}
+
 impl Gpu {
     /// Create a device on the best available adapter (no software fallback), or why there is none.
     pub fn new(backends: wgpu::Backends) -> Result<Gpu, String> {
@@ -296,7 +303,7 @@ impl Gpu {
         )
         .map_err(|e| format!("no GPU adapter among {backends:?} ({e})"))?;
         let info = adapter.get_info();
-        if info.device_type == wgpu::DeviceType::Cpu {
+        if info.device_type == wgpu::DeviceType::Cpu && !software_allowed() {
             log::info!("gpu: only a software adapter ({}), using the CPU pipeline", info.name);
             return Err(format!("software adapter ({}) skipped: the CPU pipeline is faster", info.name));
         }

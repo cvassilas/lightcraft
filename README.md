@@ -22,6 +22,12 @@
   Native on macOS, Windows and Linux. In the browser via WebAssembly. Drivable end to end by AI agents over MCP.
 </p>
 
+> **About this fork.** This is a fork of [storytold/lightcraft](https://github.com/storytold/lightcraft) that
+> reimplements editing-speed ideas from [RapidRAW](https://github.com/CyberTimon/RapidRAW) (zero-copy loupe,
+> visible-region and downscaled drags, GPU thumbnails, tiled exports) inside LightCraft's own pipeline. No RapidRAW code
+> is copied: RapidRAW is AGPL-3.0, and this fork stays MIT OR Apache-2.0. Plan and measurements:
+> [`docs/rapidraw-port.md`](docs/rapidraw-port.md).
+
 <p align="center">
   <img alt="Pure Rust" src="https://img.shields.io/badge/pure-Rust-f2a516?style=flat-square&logo=rust&logoColor=white">
   <img alt="macOS, Windows, Linux and Web" src="https://img.shields.io/badge/macOS%20%C2%B7%20Windows%20%C2%B7%20Linux%20%C2%B7%20Web-8a5800?style=flat-square">

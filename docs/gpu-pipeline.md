@@ -43,6 +43,9 @@ Overrides (read once at launch):
 - else `WGPU_BACKEND` (wgpu's own variable, same names) — before #136 only the window honoured it,
   the compute device always used Vulkan + DX12 (+ Metal).
 - `LIGHTCRAFT_GPU=0`: GPU rendering off for the process (the window is unaffected).
+- `LIGHTCRAFT_GPU_SOFTWARE=1`: accept a software adapter (llvmpipe / lavapipe) for compute, which is
+  otherwise skipped. Slower than the CPU pipeline: for running the GPU tests on machines without a GPU
+  ([`rapidraw-port.md`](rapidraw-port.md#testing-the-gpu-path-without-a-gpu)).
 
 **DX12 shader compiler (issue #471).** Every instance (window and compute) compiles DX12 shaders with
 FXC (`d3dcompiler_47.dll`, part of Windows; `lightcraft_gpu::backend::backend_options`). wgpu's
