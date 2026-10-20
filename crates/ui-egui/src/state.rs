@@ -906,6 +906,9 @@ pub struct UiState {
     /// The outcome (success or error) of the last Find Missing Photos task.
     #[serde(skip)]
     pub last_find_missing_result: Option<Result<serde_json::Value, String>>,
+    /// The outcome of the last Assisted Culling or Group Similar Photos run in the background.
+    #[serde(skip)]
+    pub last_cull: Option<Result<serde_json::Value, String>>,
     /// Injected delay for Find Missing Photos worker (test-only, for timeout testing).
     #[cfg(test)]
     #[serde(skip)]
@@ -1093,6 +1096,12 @@ pub enum Dialog {
     Cull {
         reject_below: f32,
         pick_best: bool,
+    },
+    /// Photo ▸ Stack ▸ Group Similar Photos: the largest gap between consecutive shots of a scene
+    /// (seconds) and how alike they must look (0..1).
+    GroupSimilar {
+        gap: f32,
+        similarity: f32,
     },
     /// Help ▸ System Info: (label, value) rows.
     DenoiseModel {
@@ -1385,6 +1394,7 @@ impl Default for UiState {
             toast: None,
             last_find_missing: None,
             last_find_missing_result: None,
+            last_cull: None,
             #[cfg(test)]
             find_missing_test_delay: None,
             rechecked_library: None,

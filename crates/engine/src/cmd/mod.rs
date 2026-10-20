@@ -31,7 +31,7 @@ mod masks;
 mod merge;
 pub mod metadata;
 pub mod missing;
-mod organize;
+pub(crate) mod organize;
 mod prefs;
 mod preset_files;
 pub mod previews;

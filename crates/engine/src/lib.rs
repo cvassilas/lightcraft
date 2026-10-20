@@ -25,6 +25,7 @@ pub mod config;
 pub mod contact_sheet;
 pub mod crs;
 pub mod crs_masks;
+pub mod culling;
 pub mod demo;
 pub mod denoise;
 pub mod devices;
@@ -325,8 +326,9 @@ pub struct Session {
     pub mask_tool_effects: std::collections::BTreeMap<String, String>,
     /// Saved colour-label name sets.
     pub label_sets: Vec<cmd::manage::LabelSet>,
-    /// Look-alike signatures by content key (Find Similar).
-    pub signatures: std::collections::HashMap<String, [f32; 64]>,
+    /// Culling scores (focus, clipping, look-alike signature) by content key: Assisted Culling,
+    /// Group Similar Photos, Find Similar.
+    pub scores: std::collections::HashMap<String, culling::Scores>,
     /// Imported `.cube` LUT profiles.
     pub lut_profiles: Vec<cmd::lut_profiles::LutProfile>,
     /// The target album B adds to (`None` = the Quick Collection).
@@ -475,7 +477,7 @@ impl Session {
             mask_effects: Vec::new(),
             mask_tool_effects: Default::default(),
             label_sets: Vec::new(),
-            signatures: Default::default(),
+            scores: Default::default(),
             lut_profiles: Vec::new(),
             target_album: None,
             auto_import_seen: Default::default(),
