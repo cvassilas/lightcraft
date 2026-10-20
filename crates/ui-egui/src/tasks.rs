@@ -69,6 +69,34 @@ pub fn spawn<T: Send + 'static>(
     Ok(())
 }
 
+/// [`spawn`] for work that reports progress and can be stopped: the activity stack shows `label`
+/// under `kind` with a count and ✕, and `work` gets the row's handle (`progress`, `is_cancelled`).
+pub fn spawn_tracked<T: Send + 'static>(
+    app: &mut LightcraftApp,
+    label: &str,
+    kind: &'static str,
+    work: impl FnOnce(lightcraft_engine::activity::TaskHandle) -> T + Send + 'static,
+    done: impl FnOnce(&mut LightcraftApp, &egui::Context, T) + Send + 'static,
+) -> Result<(), String> {
+    let guard = app.session.activity.start(kind, label, lightcraft_engine::activity::Cancel::Yes);
+    let handle = guard.handle();
+    let (tx, rx) = channel::<Finish>();
+    let repaint = app.tasks.repaint.clone();
+    let job = move || {
+        let t = work(handle);
+        let _ = tx.send(Box::new(move |app: &mut LightcraftApp, ctx: &egui::Context| done(app, ctx, t)));
+        if let Some(c) = repaint {
+            c.request_repaint();
+        }
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    std::thread::Builder::new().name(format!("lc-task-{label}")).spawn(job).map_err(|e| format!("{label}: could not start: {e}"))?;
+    #[cfg(target_arch = "wasm32")]
+    job();
+    app.tasks.running.push(Task { label: label.to_string(), rx, _guard: Some(guard) });
+    Ok(())
+}
+
 /// Apply finished tasks (called every frame).
 pub fn poll(app: &mut LightcraftApp, ctx: &egui::Context) {
     app.tasks.repaint = Some(ctx.clone());

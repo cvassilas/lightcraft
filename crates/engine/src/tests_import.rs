@@ -778,6 +778,112 @@ fn assisted_culling_groups_bursts_and_scores_focus() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A PNG of `img` at `dir/name` (culling and grouping tests).
+fn save_png(dir: &std::path::Path, img: &lightcraft_raster::Rgb32f, name: &str) {
+    let data: Vec<[u8; 4]> = img
+        .data
+        .iter()
+        .map(|c| {
+            let e = |v: f32| (lightcraft_color::transfer::linear_to_srgb(v.clamp(0.0, 1.0)) * 255.0).round() as u8;
+            [e(c[0]), e(c[1]), e(c[2]), 255]
+        })
+        .collect();
+    let png = lightcraft_codecs::encode_png(
+        &lightcraft_codecs::EncodeImage::rgba8(&lightcraft_raster::Rgba8 { width: img.width, height: img.height, data }),
+        &Default::default(),
+    )
+    .unwrap();
+    std::fs::write(dir.join(name), png).unwrap();
+}
+
+/// Group Similar Photos: three shots of one scene a few seconds apart become one collapsed stack
+/// with the sharpest on top; an unrelated photo, and the same scene an hour later, stay alone. A
+/// preview changes nothing, and undo takes the stack away in one step.
+#[test]
+fn group_similar_photos_stacks_scenes_sharpest_on_top() {
+    let dir = temp_dir("group-similar");
+    // a box blur, enough to lower the focus score
+    let soften = |img: &lightcraft_raster::Rgb32f| {
+        let mut soft = img.clone();
+        for _ in 0..3 {
+            let src = soft.clone();
+            let (w, h) = (src.width, src.height);
+            for y in 0..h {
+                for x in 0..w {
+                    let mut acc = [0f32; 3];
+                    let mut n = 0.0;
+                    for yy in y.saturating_sub(1)..(y + 2).min(h) {
+                        for xx in x.saturating_sub(1)..(x + 2).min(w) {
+                            let c = src.data[yy * w + xx];
+                            acc = [acc[0] + c[0], acc[1] + c[1], acc[2] + c[2]];
+                            n += 1.0;
+                        }
+                    }
+                    soft.data[y * w + x] = acc.map(|v| v / n);
+                }
+            }
+        }
+        soft
+    };
+    // the same scene at slightly different sizes, so each file is distinct (imports skip duplicates)
+    let scene = |w, h| lightcraft_scenes::demo_library()[0].render(w, h);
+    save_png(&dir, &soften(&scene(480, 320)), "a.png");
+    save_png(&dir, &scene(481, 320), "b.png");
+    save_png(&dir, &soften(&scene(482, 321)), "c.png");
+    save_png(&dir, &lightcraft_scenes::demo_library()[7].render(480, 320), "d.png");
+    save_png(&dir, &scene(483, 322), "e.png");
+    let mut s = Session::new().with_fs();
+    let r = s.execute("library.import", &json!({"paths": [dir.to_string_lossy()]})).unwrap();
+    let ids: Vec<u64> = r["imported"].as_array().unwrap().iter().filter_map(Value::as_u64).collect();
+    assert_eq!(ids.len(), 5);
+    let by_name = |s: &Session, n: &str| s.catalog.photos().find(|p| p.file_name == n).unwrap().id;
+    for (n, t) in [("a.png", "10:00:00"), ("b.png", "10:00:03"), ("c.png", "10:00:05"), ("d.png", "10:00:30"), ("e.png", "11:00:00")] {
+        let id = by_name(&s, n);
+        s.commit("t", lightcraft_catalog::Op::SetCaptured { id, captured: Some(format!("2026-05-01T{t}")) }).unwrap();
+    }
+    let pre = s.execute("stack.similar", &json!({"ids": ids, "preview": true})).unwrap();
+    assert_eq!((pre["stacks"].as_u64(), pre["photos"].as_u64()), (Some(1), Some(3)), "{pre}");
+    assert_eq!(s.catalog.stacks().count(), 0, "a preview changes nothing");
+    // measured once: the second run reads nothing
+    let pids: Vec<lightcraft_catalog::PhotoId> = ids.iter().map(|i| lightcraft_catalog::PhotoId(*i)).collect();
+    assert_eq!(s.plan_measure(&pids).to_read(), 0);
+    let r = s.execute("stack.similar", &json!({"ids": ids})).unwrap();
+    assert_eq!(r["stacks"], 1, "{r}");
+    let st = s.catalog.stack_of(by_name(&s, "a.png")).unwrap().clone();
+    assert_eq!(st.photos, vec![by_name(&s, "b.png"), by_name(&s, "a.png"), by_name(&s, "c.png")], "sharpest on top, then in capture order");
+    assert!(st.collapsed);
+    assert!(s.catalog.stack_of(by_name(&s, "d.png")).is_none() && s.catalog.stack_of(by_name(&s, "e.png")).is_none());
+    // already stacked photos are left alone
+    let again = s.execute("stack.similar", &json!({"ids": ids})).unwrap();
+    assert_eq!(again["stacks"], 0, "{again}");
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(s.catalog.stacks().count(), 0, "undo takes the stack away");
+    // a long enough gap (and the unrelated photo out of the way) puts the later shot in the scene
+    let r = s.execute("stack.similar", &json!({"ids": [ids[0], ids[1], ids[2], by_name(&s, "e.png").0], "gap": 7200})).unwrap();
+    assert_eq!(r["photos"], 4, "{r}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Measuring for culling can be stopped part way (the app's ✕): it says so, and what was measured
+/// is kept for next time.
+#[test]
+fn measuring_photos_can_be_cancelled() {
+    let mut s = Session::with_demo();
+    let ids: Vec<lightcraft_catalog::PhotoId> = s.catalog.photos().take(6).map(|p| p.id).collect();
+    let job = s.plan_measure(&ids);
+    assert_eq!(job.to_read(), 6);
+    let calls = std::sync::atomic::AtomicU64::new(0);
+    let m = job.run(&|_, total| {
+        assert_eq!(total, 6);
+        calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        false
+    });
+    assert!(m.cancelled);
+    assert!(m.scores.len() < 6, "stopped early: {} measured", m.scores.len());
+    s.keep_scores(&m);
+    assert_eq!(s.plan_measure(&ids).to_read(), 6 - m.scores.len());
+}
+
 /// Assisted culling: two look-alike shots one second apart across midnight form a burst at the end of
 /// every month, including those with fewer than 31 days.
 #[test]

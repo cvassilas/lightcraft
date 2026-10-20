@@ -249,6 +249,7 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
         Dialog::SmartRules { id: None, .. } => "New Smart Album",
         Dialog::SmartRules { .. } => "Edit Smart Album",
         Dialog::AutoStack { .. } => "Auto-Stack by Capture Time",
+        Dialog::GroupSimilar { .. } => "Group Similar Photos",
         Dialog::CreatePreset { .. } => "Create Preset",
         Dialog::CopySettings { .. } => "Choose Edit Settings to Copy",
         Dialog::PasteSettings { .. } => "Paste Selected Settings",
@@ -334,6 +335,27 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
                     let scope = if app.session.selection.ids.len() > 1 { "the selected photos" } else { "the photos in view" };
                     ui.label(
                         egui::RichText::new(crate::i18n::tr_format!("Creates {} stacks from {} of {scope}", preview["stacks"], preview["photos"], scope = crate::i18n::tr(scope))).color(t.text_dim),
+                    );
+                }
+                Dialog::GroupSimilar { gap, similarity } => {
+                    let n = app.session.selection.ids.len();
+                    let scope = if n > 1 { crate::i18n::tr_format!("the {n} selected photos", n = n) } else { crate::i18n::tr_format!("the {} photos in view", app.session.visible_cloned().len()) };
+                    ui.label(egui::RichText::new(crate::i18n::tr("Stacks look-alike shots of the same scene, the sharpest on top, among:")).color(t.text_label));
+                    ui.label(egui::RichText::new(scope).color(t.text_label));
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new(crate::i18n::tr("Shots taken within this time of each other:")).color(t.text_label));
+                    let r = ui.add(
+                        egui::Slider::new(gap, 1.0..=3600.0)
+                            .logarithmic(true)
+                            .custom_formatter(|v, _| crate::panels::dialogs::fmt_gap(v))
+                            .custom_parser(|s| s.trim().trim_end_matches('s').parse().ok()),
+                    );
+                    crate::widgets::named(r, crate::i18n::tr("Shots taken within this time of each other:"));
+                    let r = ui.add(egui::Slider::new(similarity, 0.5..=0.99).text(crate::i18n::tr("How alike")).step_by(0.01));
+                    crate::widgets::register(ui.ctx(), "field:groupSimilarity", r.rect);
+                    ui.label(
+                        egui::RichText::new(crate::i18n::tr("Runs in the background (see the activity stack); photos already in a stack are left alone. Undo removes the new stacks."))
+                            .color(t.text_dim),
                     );
                 }
                 Dialog::Cull { reject_below, pick_best } => {
@@ -1358,6 +1380,7 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
                     Dialog::FaceModel { .. } if !informational => "Install",
                     Dialog::ConfirmDelete { .. } | Dialog::DeleteKeyword { .. } | Dialog::DeleteEffects { .. } => "Delete",
                     Dialog::SaveEffect { .. } => "Create",
+                    Dialog::GroupSimilar { .. } => "Group",
                     Dialog::MovePhotos { .. } => "Move",
                     // (not "Merge": that is photo merging, HDR / panorama, in some languages)
                     Dialog::MoveKeyword { .. } => "Merge Keywords",
@@ -1871,11 +1894,13 @@ pub fn confirm_dialog(app: &mut LightcraftApp, dlg: &Dialog) -> Result<serde_jso
         Dialog::FaceModel { path, info, accepted } => crate::panels::faces::install(app, path, info, *accepted),
         Dialog::AllMetadata { .. } | Dialog::SystemInfo { .. } | Dialog::WhatsNew => Ok(serde_json::Value::Null),
         Dialog::Cull { reject_below, pick_best } => {
-            let mut p = json!({"pickBest": pick_best});
-            if *reject_below > 0.0 {
-                p["rejectBelow"] = json!(reject_below);
-            }
-            app.run("photo.analyze", p)
+            let ids = crate::cull_task::scope(app);
+            let cull = crate::cull_task::Cull::Analyze { reject_below: (*reject_below > 0.0).then_some(*reject_below), pick_best: *pick_best };
+            crate::cull_task::start(app, cull, ids)
+        }
+        Dialog::GroupSimilar { gap, similarity } => {
+            let ids = crate::cull_task::scope(app);
+            crate::cull_task::start(app, crate::cull_task::Cull::Group { gap: f64::from(*gap), similarity: *similarity }, ids)
         }
         Dialog::SmartRules { id, name, rules, parent } => {
             // refused before anything changes (not even the name)

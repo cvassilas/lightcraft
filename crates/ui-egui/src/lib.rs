@@ -13,6 +13,7 @@ pub mod canvas_keys;
 mod command_error;
 pub mod control;
 pub mod credits;
+pub mod cull_task;
 pub mod date_picker;
 pub mod docking;
 pub mod export_task;
@@ -71,6 +72,8 @@ mod tests_copy_paste_dialogs;
 mod tests_crop_rotate;
 #[cfg(test)]
 mod tests_crop_tool;
+#[cfg(test)]
+mod tests_cull_task;
 #[cfg(test)]
 mod tests_curve;
 #[cfg(test)]

@@ -194,6 +194,7 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     ("dialog.newSmartAlbum", "New Smart Album from Filter…", Some("Cmd+Alt+N"), "File"),
     ("dialog.createPreset", "Create Preset…", Some("Cmd+Shift+P"), "Photo"),
     ("dialog.autoStack", "Auto-Stack by Capture Time…", None, "Photo>Stack"),
+    ("dialog.groupSimilar", "Group Similar Photos…", None, "Photo>Stack"),
     ("dialog.copySettings", "Choose Edit Settings to Copy…", Some("Cmd+Shift+C"), "Edit"),
     ("dialog.pasteSettings", "Paste Selected Settings…", Some("Cmd+Shift+V"), "Edit"),
     ("view.focusSearch", "Find…", Some("Cmd+F"), "Edit"),
@@ -1263,6 +1264,13 @@ pub fn run_ui_command(app: &mut LightcraftApp, id: &str, p: &Value) -> Option<Re
                 folder: false,
                 parent: parent_param(p),
                 include_selected: p.get("includeSelected").and_then(Value::as_bool).unwrap_or(true),
+            });
+            Ok(Value::Null)
+        }
+        "dialog.groupSimilar" => {
+            app.ui.dialog = Some(Dialog::GroupSimilar {
+                gap: p.get("gap").and_then(Value::as_f64).unwrap_or(lightcraft_engine::culling::GROUP_GAP) as f32,
+                similarity: p.get("similarity").and_then(Value::as_f64).unwrap_or(f64::from(lightcraft_engine::culling::GROUP_SIMILARITY)) as f32,
             });
             Ok(Value::Null)
         }
